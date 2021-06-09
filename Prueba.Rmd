@@ -1,0 +1,620 @@
+---
+title: "Prueba Matemáticas Financieras"
+author: "Nicolas Robayo Pardo"
+date: "Mayo 2021"
+output: 
+  rmdformats::downcute:
+    fig_width: 9
+    fig_height: 8
+---
+# 1. Cargar los datos del Excel adjunto y hacer los ajustes necesarios para poder realizar los siguientes pasos.
+
+## Supuestos:
+Asumimos que el precio suministrado de los TES no tiene intereses por causar al día de valoración. Además, que los TES suministrados son lo suficientemente liquidos en el mercado para representar las expectativas del mercado. Finalmente, asumimos un mercado eficiente donde no es posible el arbitraje. 
+
+
+Paquetes necesarios:
+```{r paquetes, message=FALSE, warning=FALSE}
+library("plotly"); library("readxl"); library("knitr")
+```
+Importamos los datos:
+Guardamos las series de datos de precio y YTM de cada TES y su información de Maturity y cupón. 
+```{r message=FALSE, warning=FALSE}
+CORRRMIN <-
+  read_excel(
+    "20210521. Datos.xlsx",
+    sheet = "BANREP",
+    col_types = c("skip", "date", "numeric"),
+    
+  )
+CORRRMIN <- as.matrix(CORRRMIN[complete.cases(CORRRMIN),])
+rownames(CORRRMIN) <- (CORRRMIN[, 1])
+CORRRMIN <- CORRRMIN[, 2]
+MY_TES <- list()
+names <- c(1:10)
+expiration <- list()
+cupón <- c(1:10)
+bonds <- list()
+
+for (i in 1:10) {
+  MY_TES[[i]] <-
+    read_xlsx(
+      "20210521. Datos.xlsx",
+      sheet = "TES",
+      col_types = c("date", "skip", "numeric", "numeric"),
+      range = cell_cols((5 * i - 1):(5 * i + 2)),
+      na = "#N/A N/A",
+      trim_ws = T
+    )
+  names[i] <- colnames(MY_TES[[i]])[1]
+  exp <-
+    as.POSIXct(
+      stringr::str_extract(names[i], "[0-9]{2}/[0-9]{2}/[0-9]{4}"),
+      format = "%m/%d/%Y",
+      tz = "UTC"
+    )
+  expiration[[i]] <- as.Date(exp)
+  colnames(MY_TES[[i]]) <- c("Date", "YLD_YTM_MID", "PX_LAST")
+  MY_TES[[i]] <- MY_TES[[i]][complete.cases(MY_TES[[i]][, 2:3]),]
+  MY_TES[[i]][is.na(MY_TES[[i]])] <-
+    as.POSIXct("2010-01-01", tz = Sys.timezone())
+  MY_TES[[i]] <- MY_TES[[i]][MY_TES[[i]][["Date"]] <= exp,]
+  MY_TES[[i]]$Month <- months(MY_TES[[i]]$Date)
+  MY_TES[[i]]$Year <- format(MY_TES[[i]]$Date, format = "%Y")
+  
+}
+cupón <-  as.numeric(stringr::str_extract(names, "([0-9.]+) "))
+```
+
+## Visualización de datos
+Graficamos la curva de precios y Yield to Maturity del bono COLTES que vence el 07/24/2024 con cupón 10 y principal 100 USD:
+```{r}
+i<- 7
+x<- MY_TES[[i]]$Date
+y<- MY_TES[[i]]$PX_LAST
+yld <-MY_TES[[i]]$YLD_YTM_MID 
+ay <- list(
+  tickfont = list(color = "red"),
+  overlaying = "y",
+  side = "right",
+  title = "YLD YTM"
+)
+f <- list(
+  family = "Helvetica, serif",
+  color = "#7f7f7f"
+)
+yaxis <- list(
+  title = "Price",
+  titlefont = f
+)
+
+fig <- plot_ly( x = x, y = y, type = 'scatter', mode = 'lines', name = "Price Bond", )
+fig <- fig %>% add_trace(y = ~yld , name = 'Yield YTM', mode = 'lines+markers', yaxis = "y2") 
+fig <- fig %>% layout(
+    title = names[i], yaxis2 = ay, yaxis = yaxis,
+    xaxis = list(title="Fecha"), font = f
+  )
+fig
+```
+
+
+# 2. Considerar una curva cero cupón (esta es una función $f:T\rightarrow \mathbb{R}$, donde $f(t)$es la tasa de descuento compuesta continuamente para el plazo $t$; es decir, el factor de descuento al plazo $t$ es $P(t)=e^{-tf(t)}$ continua y lineal a trozos, donde los trozos se definen con los nodos [0, 1, 2, 5, 10] años.
+Implementamos un modelo de splines lineales con nodos en [0, 1, 2, 5, 10] años para modelar la curva cero cupón.
+$$
+y=\beta_0 +\beta_1x+\beta_2(x-1)_++\beta_3(x-2)_++\beta_4(x-5)_++\beta_{5}(x-10)_+ \\
+(X-\xi)_+=\cases{(x-\xi) \text{     si  } x>\xi\\
+                0 \quad \text{    dlc}}
+$$
+Donde $x:$ es el tiempo en años para el pago y $y$ es la tasa spot de la curva de cero cupón.
+## a. Programar una función que reciba (i) un título emitido por el Gobierno (madurez, cupón, frecuencia de pago del cupón, fecha de emisión) y (ii) una curva de este tipo, y devuelva el precio del título.
+
+Creamos la función `precio_justo` la cual recibe por parámetro la información del título emitido por el Gobierno  (madurez, cupón, frecuencia de pago del cupón, fecha de emisión) y la curva definida por los interceptos del modelo de splines definido anteriormente para la fecha de emisión. Con esta información, la función es capaz de calcular el precio justo basado en el flujo de pagos dada la situación de la curva spot/cero cupón para los distintos periodos. Esta función se apoya de otras funciones para calcular la curva, la tasa de cada periodo y el precio final. 
+
+
+```{r}
+precio_justo <-
+  function(madurez,
+           cupón_dolares,
+           frecuenciaAnual,
+           fechaEmision,
+           curva_fecha,
+           principal) {
+    fecha_pagos <-
+      seq(
+        from = 1 / frecuenciaAnual,
+        to = madurez,
+        by = 1 / frecuenciaAnual
+      )
+    pagos <-
+      c(rep(cupón_dolares, length(fecha_pagos) - 1), cupón_dolares + principal)
+    calcular_precio(fecha_pagos, pagos, curva_fecha)
+  }
+```
+
+Funciones auxiliares:
+```{r}
+calcular_precio<- function(vencimientos, pagos, curva){
+  tasas<- sapply(vencimientos, calcular_tasa, curva, simplify =T)
+  precio <-sum( pagos*tasas)
+  return(precio)
+} 
+
+calcular_tasa<- function(duracion, curva){
+  tasa <- curva[1]+ curva[2]*duracion + curva[3]*(duracion-1)*(duracion>1)+
+          curva[4]*(duracion-2)*(duracion>2)+
+          curva[5]*(duracion-5)*(duracion>5)+
+          curva[6]*(duracion-10)*(duracion>10)
+  return(exp(-duracion*tasa))
+}
+ 
+calcular_precios <- function(vencimientos, pagos, curva){
+  tasas<- lapply(vencimientos, calcular_tasa,curva =  curva)
+  precios <- mapply("*",pagos,tasas,SIMPLIFY = FALSE)
+  precios <- sapply(precios, sum)
+  precios
+}
+```
+## b. Implementar una metodología que reciba las tasas de los TES de la lista, y devuelva una curva cero cupón que calibre a este mercado (es decir, que minimice el error de valorar los TES).
+
+Se creará una función que reciba la fecha requerida para estimar la curva y basado en los TES que trancen ese día de la base de datos histórica se creará la curva cero cupón. Para esto se modelarán los pagos de cada TES que este tranzando basado en su cupón, vencimiento y principal y, usando el modelo de splines lineales definido, se optimizarán los coeficientes que mejor ajusten la curva cero cupón para reducir el error cuadrático medio del precio estimado de cada TES y de esta forma minimice el error de valorar los TES.
+
+$$
+\min_{b_0, b_1, b_2, b_3, b_4, b_5} \sum_{i \in TES}{(Precio_{i} - \widehat{Precio}_{i})^2}\\
+\widehat{i}_{TES} =\sum_{t\in T} P(t)*Pago_t\\
+P(t) = e^{-tf(t)}=e^{-t(\beta_0 +\beta_1t+\beta_2(t-1)_++\beta_3(t-2)_++\beta_4(t-5)_++\beta_{5}(t-10)_+ )}
+$$
+Donde $P(t)$ es el factor de descuento para la fecha del pago y el pago se define como el cupon o el cupon más el principal en caso de $t=\text{madurez}$
+```{r}
+obtener_TES <- function(fecha) {
+  j <- 0L
+  TESES <- 1
+  fechas = list()
+  pagos = list()
+  face_values = 1
+  for (i in 1:10) {
+    if (fecha %in% MY_TES[[i]]$Date) {
+      j <- j + 1L
+      years = as.POSIXct(expiration[[i]])
+      vencimiento <- as.numeric((years - fecha) / 365)
+      if (floor(vencimiento - 1) > 0) {
+        fechas[j] <-  list(seq(vencimiento %% 1, vencimiento))
+        pagos[j] <-
+          list(c(rep(cupón[i], length(fechas[[j]]) - 1), cupón[i] + 100))
+        face_values[j] <-
+          MY_TES[[i]][MY_TES[[i]]$Date == fecha ,]$PX_LAST
+      }
+      else{
+        pagos[j] <-  cupón[i] + 100
+        fechas[j] <- vencimiento
+        face_values[j] <-
+          MY_TES[[i]][MY_TES[[i]]$Date == fecha ,]$PX_LAST
+      }
+    }
+  }
+  list(fechas = fechas,
+       pagos = pagos,
+       face_values = face_values)
+}
+
+```
+
+Funciones Optimizadoras:
+```{r}
+
+calcular_MSE <- function(preciosverdaderos, precioscalculados){
+  perdida <- sum((preciosverdaderos-precioscalculados)^2)
+  return(perdida)
+}
+
+funcion_perdida <- function(curva, pagos, fechas, face_values) {
+  precios <- calcular_precios(fechas, pagos, curva)
+  perdida <- calcular_MSE(face_values, precios)
+  perdida
+}
+
+obtener_curva <- function(fecha) {
+  datos <- (obtener_TES(fecha = fecha))
+  curva_inicial <- c(0.001, 0.0015, 0.005, 0.004, 0.011, 0.009)
+  le_optimizacion <- optim(
+    curva_inicial,
+    funcion_perdida,
+    pagos = datos$pagos,
+    fechas = datos$fechas,
+    face_values =  datos$face_values
+  )
+  return(list(parametros = le_optimizacion$par, error = le_optimizacion$value))
+}
+
+```
+
+Ejemplo para un bono emitido con las siguientes caracteristicas
+
+- Principal: 100 USD
+- Madurez: 10 años
+- Fecha de emisión: 5-5-2021
+- Frecuencia de pagos anual: 2
+- Cupón: 10 USD
+
+```{r}
+principal = 100
+madurez <- 10 # años
+fecha_de_emision <-
+  as.POSIXct("05/05/2021", format = "%m/%d/%Y", tz = "UTC")
+frecuenciaAnual = 2 #Pagos Anuales
+cupón_dolares <- 10 # en Dolares
+optimizacion <- obtener_curva(fecha_de_emision)
+curva_fecha <- optimizacion$parametros
+error<- optimizacion$error
+### Resultado
+precio<- precio_justo(madurez, cupón_dolares, frecuenciaAnual, fecha_de_emision, curva_fecha, principal)
+print(paste("El precio justo es de ",precio, ". El error de esimación es de ", error ))
+```
+El precio justo de este bono es de 192.223 USD. Además, el error cuadrático medio es de 2.65.
+
+Podemos graficar la curva estimada cero cupón de este día.
+```{r}
+graficar_curva <- function(curva){
+  x <- 0:15
+  tasa <- curva[1]+ curva[2]*x + curva[3]*(x-1)*(x>1)+
+          curva[4]*(x-2)*(x>2)+
+          curva[5]*(x-5)*(x>5)+
+          curva[6]*(x-10)*(x>10)
+  fig <- plot_ly( x = x, y = tasa, name = 'Tasa zero-cupón TES', type = 'scatter', mode = 'lines+markers')  %>% 
+          layout(yaxis = list(tickformat = "%"))%>% layout( title = "Curva cero cupón TES (por splines lineales)", xaxis =  list(
+  title = "Años (Vencimiento)"
+), yaxis = list(
+  title = "Tasa cero cupón pesos"
+))
+  fig
+}
+graficar_curva(curva_fecha)
+```
+
+## c. Crear una serie de tiempo de curvas cero cupón calibrando los mercados históricos adjuntos en el EXCEL.
+Para cada día de las series de tiempo de TES estimaremos la curva cupón con el procedimiento anterior. 
+
+```{r}
+obtener_nodos<-function(fecha){
+  curva<-obtener_curva(fecha)$parametros
+  x<- c(0,1,2,5,10)
+  nodos <- curva[1]+ curva[2]*x + curva[3]*(x-1)*(x>1)+
+          curva[4]*(x-2)*(x>2)+
+          curva[5]*(x-5)*(x>5)+
+          curva[6]*(x-10)*(x>10)
+  return(nodos)
+}
+serie_tiempo <- data.frame( Date = MY_TES[[7]]$Date, t(sapply(MY_TES[[7]]$Date, obtener_nodos)))
+kable(head(serie_tiempo), digits = 3, caption = "Serie de Tiempo de las curvas cero cupón de Colombia")
+```
+
+
+
+
+# 3.Tomar la serie de tiempo de curvas y determinar los primeros tres componentes principales de la curva (tomando como variables las tasas de los cinco nodos).
+
+## a. Escoger una frecuencia adecuada para el análisis pedido (diario, semanal, o mensual).
+Escogemos una frecuencia mensual dado que es necesario tener suficientes datos para estimar una matriz de covarianzas. Además, esto permitirá reducir la variación de los datos debido a la estimación lineal. 
+
+```{r}
+serie_tiempo$Month <- months(serie_tiempo$Date)
+serie_tiempo$Year <- format(serie_tiempo$Date, format = "%Y")
+
+obtener_componentes<- function(mes, año){
+  this_month <-
+  serie_tiempo[serie_tiempo$Month == mes &
+                 serie_tiempo$Year == año, c("X1", "X2", "X3", "X4", "X5")]
+rownames(this_month) <-
+  serie_tiempo[serie_tiempo$Month == mes &
+                 serie_tiempo$Year == año, c("Date")]
+
+analisis_componentes <-  prcomp(this_month, scale = T, center = F, retx = T)
+return(list( x= this_month, comp = analisis_componentes))
+}
+```
+
+## b.  Determinar los vectores propios, escalados por la raíz de los valores propios correspondientes. Dé una intuición sobre los valores de los primeros tres vectores propios y su relación con las características relevantes de la curva (nivel, empinamiento, curvatura, etc.).
+Usaremos el mes de Abril/2021 para observar los vectores propios resultado de la descomposición en componentes principales. Los datos de cada mes serán escalados por su varianza y se usaran los metodos de PCA del paquete `stats` de R. Este mes tiene suficientes observaciones para hacer un análisis robusto. 
+```{r}
+
+comp <-obtener_componentes("April", 2021)
+
+analisis_componentes <- comp$comp
+this_month <- comp$x
+
+eigen_vectores_princ <-  analisis_componentes$rotation[,1:3]
+porcentaje_varianza <- data.frame(Varianza = (analisis_componentes$sdev/ sum(analisis_componentes$sdev))[1:3] )
+kable(list(eigen_vectores_princ, porcentaje_varianza)          
+      , caption="Loadings de los componentes principales y su % de varianza explicada", booktabs = TRUE, valign = 't')
+
+colnames(eigen_vectores_princ)<-c("PC1","PC2","PC3")
+fig <- plot_ly(as.data.frame(eigen_vectores_princ), x =c(0,1,2,5,10) ,y = ~-PC1,type = 'scatter', mode = 'lines+markers', name = "Nivel") 
+fig <- fig %>% add_trace(y = ~PC2, name = 'Pendiente',mode = 'lines+markers') 
+fig <- fig %>% add_trace(y = ~-PC3, name = 'Curvatura', mode = 'lines+markers') 
+fig <- fig %>% layout(title = "Gráfica de Bonos cero cupón contra sus primeros tres componentes (Abril/2021)",
+         xaxis = list(title = "Años para madurez"),
+         yaxis = list (title = "Puntos Básicos"))
+fig
+```
+
+El primer loading (azul) representa el nivel o cambio paralelo de la curva de cero cupón. Se puede pensar en este como las expectativas de la tasa a largo plazo.  No cambia de signo y además se mantiene alrededor del mismo valor para todos los vencimientos. Este nivel cambia cuando las tasas de interes para todos los vencimientos cambian por la misma cantidad y se puede relacionar con la inflación. 
+
+El segundo vector propio se puede considerar como la pendiente que causa el incremento de la prima por mayor madurez. Esta aumenta de forma importante durante los primeros dos años dado que la curva de cero cupón tiene su mayor pendiente durante este periodo y se mantiene positiva. Se relaciona con otras medidas macroeconomicas como las tasas de interes del banco central por su relación con la inflación a largo plazo o la prima de riesgo del mercado. 
+
+Finalmente el tercer vector propio se puede ver como la curvatura de la curva cero cupón. Al inicio del periodo (0-2 años) se mantiene positiva y representa la flexión que existe en este periodo de la curva siendo altamente no lineal. Para los periodos subsecuentes, esta es negativa indicando que se reduce la curvatura (no linealidad) de la curva cero cupón. Esto tiene sentido ya que esta curva se estabiliza linealmente para periodos de madurez altos. Este vector se puede relacionar con cambios en la volatilidad de las tasas de interes.
+
+## c. Determinar la serie de tiempo de loadings de los componentes principales.
+
+### Primer Componente Principal
+Comparamos el primer componente principal a la tasa actual (0 años).
+```{r}
+
+componentes<- as.matrix(scale(this_month, center = F, scale =T)) %*%  (eigen_vectores_princ)
+plot_ly(
+  x = rownames(this_month),
+  y = -componentes[, 1],
+  type = 'scatter',
+  mode = 'lines',
+  name = "Primer Componente Principal (Nivel)"
+) %>% add_trace(
+  y = ~ scale(this_month, center = F, scale =T)[,1],
+  name = 'Tasa actual',
+  mode = 'lines+markers',
+  yaxis = "y2"
+) %>% layout(
+  title = "1er Componente Principal",
+  yaxis2 = list(
+    tickfont = list(color = "red"),
+    overlaying = "y",
+    side = "right",
+    title = "Tasa TES estandarizada"
+  ),
+  yaxis= list(
+  title = "Score Space"
+),
+  xaxis = list(title = "Fecha")
+)
+
+```
+
+
+
+
+### Segundo Componente Principal
+Considerando que el segundo componente se refiere a la pendiente de la curva hacemos un proxy de este mediante la diferencia entre la tasa de 10 años y la actual. Vemos que el segundo componente sigue el mismo patrón que esta proxy.
+
+```{r}
+slope <- scale(this_month, center = F, scale =T)[,5] - scale(this_month, center = F, scale =T)[,1]
+#slope<- this_month[,5]- this_month[,1]
+plot_ly(
+  x = rownames(this_month),
+  y = componentes[, 2],
+  type = 'scatter',
+  mode = 'lines',
+  name = "Segundo Componente Principal (Pendiente)"
+) %>% add_trace(
+  y = ~ slope,
+  name = 'Spread 10 años',
+  mode = 'lines+markers',
+  yaxis = "y2"
+) %>% layout(
+  title = "2do Componente Principal",
+  yaxis2 = list(
+    tickfont = list(color = "red"),
+    overlaying = "y",
+    side = "right",
+    title = "Tasa TES estandarizada"
+  ),
+  yaxis =list(
+  title = "Score Space"
+),
+  xaxis = list(title = "Fecha")
+)
+```
+
+### Tercer Componente Principal
+
+```{r}
+plot_ly(
+  x = rownames(this_month),
+  y = -componentes[, 3],
+  type = 'scatter',
+  mode = 'lines',
+  name = "Tercer Componente Principal (Curvatura)"
+) %>% layout(
+  title = "Tercer Componente Principal (Curvatura)",
+  yaxis2 = list(
+    tickfont = list(color = "red"),
+    overlaying = "y",
+    side = "right",
+    title = "Tasa TES estandarizada"
+  ),
+  yaxis =list(
+  title = "Score Space"
+),
+  xaxis = list(title = "Fecha")
+)
+```
+
+
+# 4. Analizar el empinamiento actual de la curva en un contexto histórico (por ejemplo, buscar alguna forma de mapear la pendiente actual a un percentil histórico).
+Para esto graficaremos los componentes de empinamiento en un gráfico de cajas y bigotes para entender la posición de la curva actual respecto al contexto histórico. El mes de Mayo 2021 está seleccionado en la gráfica. Para este mes, los valores de empinamiento de para vencimientos 0 y 1 años se encuentran alrededor del promedio histórico en el percentil 62 y 42 respectivamente. Por otro lado los empinamientos para los vencimientos de 2 y 5 años se encuentran por encima del promedio en el percentil 83 y 98 respectivamente. Esto da a entender que el mercado está señalando una posible alza de tasas del banco de la república para dentro de 2-5 años. Finalmente el empinamiento de 10 años está en el percentil 29 lo cual señala que a largo plazo se espera una estabilidad de las tasas. Hay que recordar que actualmente, las tasas del Banco de la República están en su punto más bajo en la historia por lo que este análisis es de importancia para conocer el futuro cercano de esta tasa y analizar la probabilidad de su incremento.
+
+```{r}
+empinamiento <- unique(serie_tiempo[7:8])
+empinamiento <-
+  t(apply(empinamiento, 1, function(y)
+    obtener_componentes(y['Month'], y['Year'])$comp$rotation[, 2]))
+rownames(empinamiento) <-
+  paste(unique(serie_tiempo[7:8])[, 1], unique(serie_tiempo[7:8])[, 2])
+empinamiento <-
+  empinamiento - 2 * (empinamiento[, 5] < 0 &
+                        empinamiento[, 4] < 0) * empinamiento
+colnames(empinamiento) <- c("0Y", "1Y", "2Y", "5Y", "10Y")
+posicion <-
+  data.frame(
+    probabilidad = sapply(1:5, function(i)
+      ecdf(empinamiento[, i])(empinamiento[137, i])),
+    row.names = c("0Y", "1Y", "2Y", "5Y", "10Y")
+  )
+kable(posicion, digits = 3, caption = "Distribución de los valores de la curva para el mes de Mayo 2021")
+
+fig <-
+  plot_ly(
+    y = ~ empinamiento[, 1],
+    type = "box",
+    boxpoints = 'all',
+    text = rownames(empinamiento),
+    name = "Empinamiento en 0Y",
+    selectedpoints   = c(136, 137),
+    selected = list(marker = list(
+      opacity = 1,
+      color = 'rgb(17, 157, 255)',
+      size = 10
+    ))
+  ) %>% add_trace(
+    y = empinamiento[, 2],
+    quartilemethod = "inclusive",
+    name = "Empinamiento en 1Y",
+    boxpoints = 'all'
+  ) %>% add_trace(
+    y = empinamiento[, 3],
+    quartilemethod = "inclusive",
+    name = "Empinamiento en 2Y",
+    boxpoints = 'all'
+  )%>% add_trace(
+    y = empinamiento[, 4],
+    quartilemethod = "inclusive",
+    name = "Empinamiento en 5Y",
+    boxpoints = 'all'
+  ) %>% add_trace(
+    y = empinamiento[, 5],
+    quartilemethod = "inclusive",
+    name = "Empinamiento en 10Y",
+    boxpoints = 'all'
+  ) %>% add_trace(
+    y = empinamiento[, 5],
+    quartilemethod = "inclusive",
+    name = "Empinamiento en 10Y",
+    boxpoints = 'all'
+  ) %>% layout(title = "Caja y Bigotes para niveles de la curva de pendiente",
+               yaxis = list(title = "Empinamiento en puntos básicos"))
+fig
+
+
+```
+
+# 5. Analizar el cambio de pendiente de la curva en los últimos tres meses en un contexto histórico (qué tanto cambia típicamente la curva en periodos de tres meses).
+
+Revisemos el cambio que ha tenido el segundo componente o pendiente de la curva en los últimos tres meses. En general, durante las crisis financieras la volatilidad de la curva incrementa y con ella su pendiente.
+
+```{r}
+fig <-
+  plot_ly(
+    z = ~ empinamiento[135:137, ],
+    x = c(0, 1, 2, 5, 10),
+    y = rownames(empinamiento[135:137, ]) ,
+    name = "Empinamiento"
+  )
+fig <- fig %>% add_surface()
+fig <- fig %>% layout(title = "Segundo Componente (Pendiente) de la curva cero cupón Colombiana",
+                      scene = list(
+                        xaxis = list(title = "Tiempo para expiración (años)"),
+                        yaxis = list(title = "Fecha"),
+                        zaxis = list(title = "Pendiente")
+                      ))
+fig
+```
+
+Observamos que la pendiente ha aumentado para casi todos los vencimientos excepto 1 año. Esto probablemente refleja las expectativas de crecimiento a largo plazo pero señala que la recuperación será más larga en el corto plazo. 
+
+Ahora, revisemos el spread de 3 meses de la pendiente de la curva para todos los vencimientos para revisar que tan común es la variabilidad. 
+
+```{r}
+Spread <- empinamiento[3:137,] -empinamiento[1:(137-2),] 
+
+fig <-
+  plot_ly(
+    z = ~ Spread,
+    x = c(0, 1, 2, 5, 10),
+    y = rownames(Spread) ,
+    name = "Empinamiento"
+  )
+fig <- fig %>% add_surface()
+fig <- fig %>% layout(title = "Spread de 3 meses del segundo Componente",
+                      scene = list(
+                        xaxis = list(title = "Tiempo para expiración (años)"),
+                        yaxis = list(title = "Fecha"),
+                        zaxis = list(title = "Diferencial de Pendiente")
+                      ,      camera = list(eye = list(x = -1, y = 0, z = 0)), 
+                      aspectratio = list(x = .9, y = .8, z = 0.2)))
+
+fig
+```
+
+Observamos que los cambios más pronunciados ocurren dentro del periodo de 0 a 2 años de la curva. Los meses con movimientos positivos más pronunciados son Sept/2015, Marzo/2011, Sept/2017 y Agosto/2020. Estos meses pueden entenderse como aquellos donde se espera un crecimiento económico en el corto plazo. Por otro lado, los meses con caidas más pronunciadas en la pendiente han sido Enero/2021, Dec/2018, Enero/2015 y Sept/2012. Estos meses representan situaciones donde el estado de la economía en el corto plazo ha desmejorado y por lo tanto se han revisado las expectativas de crecimiento. Entre mayor volatilidad o spread se entiende que hay más estrés en los mercados financieros.
+
+En el gráfico está seleccinado el mes de Mayo/2021.
+
+```{r}
+fig <-
+  plot_ly(
+    y = ~ Spread[,1],
+    type = "box",
+    boxpoints = 'all',
+    text = rownames(Spread),
+    name = "0Y",
+    selectedpoints   = c(134,135),
+    selected = list(marker = list(
+      opacity = 1,
+      color = 'rgb(255, 157, 17)',
+      size = 10
+    ))
+  )%>% add_trace(
+    y = Spread[,2],
+    quartilemethod = "inclusive",
+    name = "1Y",
+    boxpoints = 'all'
+  ) %>% add_trace(
+    y = Spread [,3],
+    quartilemethod = "inclusive",
+    name = "2Y",
+    boxpoints = 'all'
+  ) %>% add_trace(
+    y = Spread[,4],
+    quartilemethod = "inclusive",
+    name = "5Y",
+    boxpoints = 'all'
+  ) %>% add_trace(
+    y = Spread[,5],
+    quartilemethod = "inclusive",
+    name = "10Y",
+    boxpoints = 'all'
+  ) %>% layout(title = "Spread 3 meses de la pendiente",
+               yaxis = list(title = "Diferencia de empinamiento en puntos básicos"))
+
+fig
+```
+
+Podemos entender la situación de Mayo/2021 a través del gráfico de cajas y bigotes. La expectativa de incremento de tasas del banco en un año ha disminuido en los ultimos tres meses pero ha aumentado la expectativa para 2 y 5 años. Lo ultimo se entiende como una expectativa de crecimiento económico y por lo tanto de la desestimulación de la economía a través de las tasas debido a la posible inflación a largo plazo. Estamos viviendo por lo tanto, un cambio de pendiente no común para las tasas a largo plazo debido a la recuperación económica. Esto solo pasa en mercados financieros que han sufrido de inestabilidad económica. 
+
+```{r}
+yield<-as.matrix(serie_tiempo[,c("X1","X2","X3","X4","X5")])
+ fig <-
+  plot_ly(
+    z = ~ yield,
+    x = c(0, 1, 2, 5, 10) ,
+    y = (MY_TES[[7]])$Date,
+    name = "Empinamiento"
+  )
+fig <- fig %>% add_surface()
+fig <- fig %>% layout(title = "Curva Cero cupón",
+                      scene = list(
+                        xaxis = list(title = "Tiempo para expiración (años)"),
+                        yaxis = list(title = "Fecha"),
+                        zaxis = list(title = "Tasa (Yield)")
+                      ,      camera = list(eye = list(x = -1, y = 0, z = 0)), 
+                      aspectratio = list(x = .9, y = .8, z = 0.2)))
+
+fig
+```
+
